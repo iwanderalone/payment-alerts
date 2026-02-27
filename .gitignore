@@ -1,0 +1,28 @@
+# secrets
+.env
+*.pem
+*.key
+id_rsa*
+secrets.yml
+
+# py
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# system trash
+.DS_Store
+Thumbs.db
+
+# logs & bkp
+*.log
+tmp/
+temp/
+.bkp
+
+# ides
+.idea/
+.vscode/
