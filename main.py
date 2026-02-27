@@ -15,6 +15,7 @@ from logging.handlers import TimedRotatingFileHandler
 
 import requests
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 
 # --- SETUP PATHS & ENV ---
 script_dir = pathlib.Path(__file__).parent.absolute()
@@ -41,16 +42,14 @@ _raw_tags = [x.strip() for x in os.getenv("TELEGRAM_TAGS", "").split(",")]
 _raw_allowed_senders = [x.strip() for x in os.getenv("ALLOWED_SENDERS", "").split(",")]
 _raw_company_keywords = [x.strip() for x in os.getenv("COMPANY_KEYWORDS", "").split(",")]
 
-START_DATE = os.getenv("START_DATE", "")
+START_DATE_ENV = os.getenv("START_DATE", "")
 
-# Full keyword list as requested
+# Global search phrases (RU/EN)
 GLOBAL_ALERT_PHRASES = [
-    # Russian
     "пора пополнить баланс", "доступ к сервисам ограничен", "истекает",
     "закончатся средства", "пополните баланс", "услуга приостановлена",
     "доступ заблокирован", "срок действия истекает", "оплатите",
     "задолженность", "не удалось списать", "требуется оплата",
-    # English
     "payment due", "service suspended", "account suspended", "expires",
     "expiring soon", "low balance", "top up your balance", "billing issue",
     "invoice overdue", "subscription expired", "credit card was declined"
@@ -66,41 +65,30 @@ logger.addHandler(handler)
 logger.addHandler(logging.StreamHandler())
 
 # --- HELPERS ---
-def parse_chat_destination(raw: str) -> dict:
-    if ":" in raw:
-        chat_id, topic_id = raw.split(":", 1)
-        return {"chat_id": chat_id.strip(), "topic_id": int(topic_id.strip())}
-    return {"chat_id": raw.strip(), "topic_id": None}
-
-def parse_plus_list(raw: str) -> list[str]:
-    return [x.strip() for x in raw.split("+") if x.strip()]
-
-def build_company_configs() -> list[dict]:
-    companies = []
-    for i, email_addr in enumerate(EMAILS):
-        dest = parse_chat_destination(_raw_chat_ids[i]) if i < len(_raw_chat_ids) else {"chat_id": "", "topic_id": None}
-        tags = [f"@{u}" for u in parse_plus_list(_raw_tags[i])] if i < len(_raw_tags) else []
-        senders = [s.lower() for s in parse_plus_list(_raw_allowed_senders[i])] if i < len(_raw_allowed_senders) else []
-        extra_k = [k.lower() for k in parse_plus_list(_raw_company_keywords[i])] if i < len(_raw_company_keywords) else []
-
-        companies.append({
-            "email": email_addr,
-            "password": PASSWORDS[i] if i < len(PASSWORDS) else "",
-            "name": COMPANY_NAMES[i] if i < len(COMPANY_NAMES) else email_addr,
-            "chat_id": dest["chat_id"],
-            "topic_id": dest["topic_id"],
-            "tags": tags,
-            "allowed_senders": senders,
-            "keywords": list(set(GLOBAL_ALERT_PHRASES + extra_k)),
-        })
-    return companies
+def resolve_since_date() -> str:
+    """ Formats date for IMAP: DD-Mon-YYYY """
+    if START_DATE_ENV:
+        try:
+            dt = datetime.strptime(START_DATE_ENV, "%Y-%m-%d")
+            return dt.strftime("%d-%b-%Y")
+        except ValueError:
+            logger.warning(f"Invalid START_DATE format: {START_DATE_ENV}. Use YYYY-MM-DD. Falling back to 24h.")
+    return (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
 
 def clean_html_content(raw_html: str) -> str:
-    text = re.sub(r"<(style|script|head|title)[^>]*>.*?</\1>", " ", raw_html, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html.unescape(text)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
+    try:
+        soup = BeautifulSoup(raw_html, "lxml")
+        for element in soup(["script", "style", "head", "title", "meta", "[document]"]):
+            element.decompose()
+        text = soup.get_text(separator=' ')
+        text = html.unescape(text)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"BS4 failed, using regex fallback: {e}")
+        text = re.sub(r"<(style|script)[^>]*>.*?</\1>", " ", raw_html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return " ".join(text.split())
 
 def extract_clean_text(msg) -> str:
     text_parts = []
@@ -108,8 +96,8 @@ def extract_clean_text(msg) -> str:
         for part in msg.walk():
             ctype = part.get_content_type()
             cdisp = str(part.get("Content-Disposition", ""))
-            if "attachment" in cdisp:
-                continue
+            if "attachment" in cdisp: continue
+            
             if ctype == "text/plain":
                 payload = part.get_payload(decode=True)
                 if payload:
@@ -142,6 +130,7 @@ def decode_header_value(value: str) -> str:
             decoded.append(str(val))
     return "".join(decoded)
 
+# --- TRACKING ---
 def load_processed_ids() -> dict:
     if not PROCESSED_FILE.exists(): return {}
     try:
@@ -157,85 +146,94 @@ def save_processed_ids(data: dict):
 
 # --- CORE LOGIC ---
 def check_mail():
-    companies = build_company_configs()
     processed = load_processed_ids()
-    since_date = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y") if not START_DATE else START_DATE
-
-    for comp in companies:
-        mail = None
+    since_date = resolve_since_date()
+    
+    # Rebuild configs to ensure we use current env
+    for i, email_addr in enumerate(EMAILS):
         try:
-            logger.info(f"Checking {comp['name']} ({comp['email']})...")
+            # Build current company config
+            dest = {"chat_id": _raw_chat_ids[i], "topic_id": None}
+            if ":" in dest["chat_id"]:
+                cid, tid = dest["chat_id"].split(":", 1)
+                dest = {"chat_id": cid.strip(), "topic_id": int(tid.strip())}
+            
+            tags = [f"@{u}" for u in _raw_tags[i].split("+") if u.strip()] if i < len(_raw_tags) else []
+            senders = [s.lower() for s in _raw_allowed_senders[i].split("+") if s.strip()] if i < len(_raw_allowed_senders) else []
+            extra_k = [k.lower() for k in _raw_company_keywords[i].split("+") if k.strip()] if i < len(_raw_company_keywords) else []
+            keywords = list(set(GLOBAL_ALERT_PHRASES + extra_k))
+            
+            company_name = COMPANY_NAMES[i] if i < len(COMPANY_NAMES) else email_addr
+            password = PASSWORDS[i]
+
+            logger.info(f"Checking {company_name} ({email_addr})...")
+            
             mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-            mail.login(comp['email'], comp['password'])
+            mail.login(email_addr, password)
             mail.select("INBOX", readonly=True)
 
-            status, messages = mail.search(None, f'(SINCE "{since_date}")')
-            if status != "OK" or not messages[0]:
-                continue
+            # FIX: Use tuple arguments for SEARCH to avoid syntax errors
+            status, messages = mail.search(None, 'SINCE', since_date)
+            
+            if status == "OK" and messages[0]:
+                for num in messages[0].split():
+                    status, data = mail.fetch(num, "(RFC822)")
+                    if status != "OK": continue
 
-            for num in messages[0].split():
-                status, data = mail.fetch(num, "(RFC822)")
-                if status != "OK": continue
+                    msg = email.message_from_bytes(data[0][1])
+                    msg_id = msg.get("Message-ID", f"{email_addr}-{num.decode()}")
+                    if msg_id in processed: continue
 
-                msg = email.message_from_bytes(data[0][1])
-                msg_id = msg.get("Message-ID", f"{comp['email']}-{num.decode()}")
-                
-                if msg_id in processed: continue
+                    subject = decode_header_value(msg.get("Subject"))
+                    from_raw = decode_header_value(msg.get("From"))
+                    _, sender_email = parseaddr(from_raw.lower())
 
-                subject = decode_header_value(msg.get("Subject"))
-                from_raw = decode_header_value(msg.get("From"))
-                _, sender_email = parseaddr(from_raw.lower())
+                    if senders and not any(s in sender_email for s in senders):
+                        processed[msg_id] = datetime.now().isoformat()
+                        continue
 
-                if comp['allowed_senders'] and not any(s in sender_email for s in comp['allowed_senders']):
+                    body = extract_clean_text(msg)
+                    haystack = f"{subject} {body}".lower()
+                    
+                    if any(k.lower() in haystack for k in keywords):
+                        send_alert(company_name, from_raw, subject, body, dest, tags)
+                    
                     processed[msg_id] = datetime.now().isoformat()
-                    continue
-
-                body = extract_clean_text(msg)
-                haystack = f"{subject} {body}".lower()
-                matches = [k for k in comp['keywords'] if k in haystack]
-
-                if matches:
-                    send_alert(comp, from_raw, subject, body)
-                
-                processed[msg_id] = datetime.now().isoformat()
 
             mail.logout()
             save_processed_ids(processed)
-            time.sleep(1) 
+            time.sleep(1)
 
         except Exception as e:
-            logger.error(f"Error checking {comp['email']}: {e}")
+            logger.error(f"Error checking {email_addr}: {e}")
 
-def send_alert(comp, sender, subject, body):
-    tag_line = " ".join(comp["tags"])
+def send_alert(name, sender, subject, body, dest, tags):
+    tag_line = " ".join(tags)
     msg_text = (
         f"💳 *Billing Alert*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏢 *Company:* {comp['name']}\n"
+        f"🏢 *Company:* {name}\n"
         f"📧 *From:* `{sender}`\n"
         f"📌 *Subject:* {subject}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 *Email Content:*\n{body}\n"
     )
-    if tag_line:
-        msg_text += f"\n🔔 {tag_line}"
+    if tag_line: msg_text += f"\n🔔 {tag_line}"
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": comp["chat_id"],
+        "chat_id": dest["chat_id"],
         "text": msg_text,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
-    if comp.get("topic_id"):
-        payload["message_thread_id"] = comp["topic_id"]
+    if dest["topic_id"]: payload["message_thread_id"] = dest["topic_id"]
 
     try:
-        r = requests.post(url, json=payload, timeout=15)
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=15)
         r.raise_for_status()
-        logger.info(f"Alert sent for {comp['name']}")
+        logger.info(f"Alert sent for {name}")
     except Exception as e:
-        logger.error(f"Failed to send TG alert: {e}")
+        logger.error(f"Telegram failed: {e}")
 
 if __name__ == "__main__":
     logger.info(f"Bot started. Polling interval: {CHECK_INTERVAL}s")
